@@ -425,9 +425,15 @@ function renderPrognose(innenTemp, innenLF, schwelle) {
   if (gruenesFenster) {
     const von = bewertet[gruenesFenster.start].zeit.slice(11, 16);
     const bis = bewertet[gruenesFenster.ende].zeit.slice(11, 16);
-    const maxDiff = Math.max(...bewertet.slice(gruenesFenster.start, gruenesFenster.ende + 1).map(h => h.diff));
+    const fensterStunden = bewertet.slice(gruenesFenster.start, gruenesFenster.ende + 1);
+    const maxDiff = Math.max(...fensterStunden.map(h => h.diff));
+    // Stunde mit größter Differenz = größtes Trocknungspotential -> für Ziel-LF verwenden
+    const besteStunde = fensterStunden.reduce((a, b) => (b.diff > a.diff ? b : a));
+    const zielLFFenster = erreichbareZielLF(innenTemp, besteStunde.temp, besteStunde.lf);
     fensterEl.innerHTML = `Beste Lüftungszeit: <strong>${von}&ndash;${bis} Uhr</strong> `
-      + `(Taupunktdifferenz bis zu +${maxDiff.toFixed(1)} &deg;C)`;
+      + `(Taupunktdifferenz bis zu +${maxDiff.toFixed(1)} &deg;C um ${besteStunde.zeit.slice(11,16)} Uhr).<br>`
+      + `Erreichbare Ziel-LF in diesem Fenster (Best-Case, vollständiger Austausch): `
+      + `<strong>${zielLFFenster.toFixed(0)} %</strong> (aktuell: ${innenLF.toFixed(0)} %)`;
   } else {
     fensterEl.innerHTML = `In den nächsten 24h wird die Schwelle von ${schwelle} &deg;C nicht erreicht &mdash; `
       + `kein klar günstiges Zeitfenster. Kurz stoßlüften bringt nur begrenzten Effekt.`;
