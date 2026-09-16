@@ -140,6 +140,46 @@
     color: var(--text-muted);
     margin-top: 1.5rem;
   }
+  .timeline {
+    display: flex;
+    gap: 3px;
+    overflow-x: auto;
+    padding-bottom: 0.4rem;
+  }
+  .stunde {
+    flex: 0 0 26px;
+    height: 44px;
+    border-radius: 4px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    cursor: default;
+  }
+  .stunde.gruen { background: var(--green); }
+  .stunde.gelb  { background: var(--yellow); }
+  .stunde.rot   { background: color-mix(in srgb, var(--red) 55%, transparent); }
+  .stunde .label {
+    font-family: var(--mono);
+    font-size: 0.62rem;
+    color: rgba(0,0,0,0.55);
+    margin-bottom: 3px;
+  }
+  .fenster-text {
+    font-size: 0.88rem;
+    margin-top: 0.9rem;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--panel-border);
+  }
+  .fenster-text strong { color: var(--accent); }
+  .legende {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.6rem;
+  }
+  .legende span { display: flex; align-items: center; gap: 0.35rem; }
+  .legende .chip { width: 9px; height: 9px; border-radius: 2px; }
 </style>
 </head>
 <body>
@@ -177,6 +217,17 @@
 
   <div id="ergebnis"></div>
 
+  <div class="panel" id="prognose-panel" style="display:none;">
+    <h2>Prognose &mdash; nächste 24 Stunden</h2>
+    <div class="timeline" id="timeline"></div>
+    <div class="legende">
+      <span><span class="chip" style="background:var(--green)"></span>Lüften gut</span>
+      <span><span class="chip" style="background:var(--yellow)"></span>Lüften schwach</span>
+      <span><span class="chip" style="background:color-mix(in srgb, var(--red) 55%, transparent)"></span>Nicht lüften</span>
+    </div>
+    <div class="fenster-text" id="fenster-text"></div>
+  </div>
+
   <p class="note">
     Berechnung nach Magnus-Formel. Ziel-Luftfeuchte = theoretischer Best-Case
     bei vollständigem Luftaustausch (Wasserdampf-Partialdruck der Außenluft
@@ -188,6 +239,7 @@
 <script>
 const LAT = 52.52, LON = 13.405;
 let aussenData = null;
+let stundenData = null; // Array {zeit, temp, lf, taupunkt} für die nächsten 24h
 
 // --- Magnus-Formel ---
 function saettigungsdampfdruck(t) {
@@ -210,18 +262,47 @@ function erreichbareZielLF(innenT, aussenT, aussenRF) {
   return Math.min((eAussen / esInnen) * 100, 100);
 }
 
-// --- Live-Daten abrufen ---
+// --- Live-Daten abrufen (current + hourly in einem Request) ---
+function berlinStundeISO(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', hourCycle: 'h23'
+  }).formatToParts(date);
+  const get = t => parts.find(p => p.type === t).value;
+  return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:00`;
+}
+
 async function holeAussenwerte() {
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}&current=temperature_2m,relative_humidity_2m,dew_point_2m&timezone=Europe%2FBerlin`;
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
+    `&current=temperature_2m,relative_humidity_2m,dew_point_2m` +
+    `&hourly=temperature_2m,relative_humidity_2m,dew_point_2m` +
+    `&forecast_days=2&timezone=Europe%2FBerlin`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error('API-Fehler: ' + resp.status);
   const json = await resp.json();
-  return {
+
+  const current = {
     temp: json.current.temperature_2m,
     lf: json.current.relative_humidity_2m,
     taupunkt: json.current.dew_point_2m,
     zeit: json.current.time
   };
+
+  // Stündliche Prognose: nächste 24h ab jetzt (Europe/Berlin) herausfiltern
+  const jetztISO = berlinStundeISO(new Date());
+  let startIdx = json.hourly.time.findIndex(t => t >= jetztISO);
+  if (startIdx === -1) startIdx = 0;
+  const stunden = [];
+  for (let i = startIdx; i < startIdx + 24 && i < json.hourly.time.length; i++) {
+    stunden.push({
+      zeit: json.hourly.time[i],
+      temp: json.hourly.temperature_2m[i],
+      lf: json.hourly.relative_humidity_2m[i],
+      taupunkt: json.hourly.dew_point_2m[i]
+    });
+  }
+
+  return { current, stunden };
 }
 
 function renderAussen() {
@@ -281,13 +362,85 @@ function berechne() {
       <div class="row"><span class="label">Erreichbare Ziel-LF (Best-Case)</span><span class="val">${zielLF.toFixed(0)} %</span></div>
     </div>
   `;
+
+  renderPrognose(innenTemp, innenLF, schwelle);
+}
+
+function klassifiziere(diff, schwelle) {
+  if (diff >= schwelle) return 'gruen';
+  if (diff > 0) return 'gelb';
+  return 'rot';
+}
+
+function renderPrognose(innenTemp, innenLF, schwelle) {
+  const panel = document.getElementById('prognose-panel');
+  if (!stundenData || stundenData.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+
+  const tpInnen = taupunkt(innenTemp, innenLF);
+  const bewertet = stundenData.map(h => {
+    const diff = tpInnen - h.taupunkt;
+    return { ...h, diff, klasse: klassifiziere(diff, schwelle) };
+  });
+
+  // Timeline rendern
+  const timelineEl = document.getElementById('timeline');
+  timelineEl.innerHTML = bewertet.map(h => {
+    const stunde = h.zeit.slice(11, 13);
+    const titel = `${h.zeit.slice(11, 16)} Uhr — ${h.temp.toFixed(1)}°C, ${h.lf.toFixed(0)}% rF, `
+      + `Taupunkt ${h.taupunkt.toFixed(1)}°C, Differenz ${h.diff >= 0 ? '+' : ''}${h.diff.toFixed(1)}°C`;
+    return `<div class="stunde ${h.klasse}" title="${titel}"><span class="label">${stunde}</span></div>`;
+  }).join('');
+
+  // Bestes zusammenhängendes "grün"-Fenster finden (bei Bedarf "gelb" als Fallback)
+  function laengstesFenster(klasse) {
+    let beste = null, aktuellStart = null;
+    for (let i = 0; i < bewertet.length; i++) {
+      const istTreffer = klasse === 'gruen'
+        ? bewertet[i].klasse === 'gruen'
+        : (bewertet[i].klasse === 'gruen' || bewertet[i].klasse === 'gelb');
+      if (istTreffer) {
+        if (aktuellStart === null) aktuellStart = i;
+      } else {
+        if (aktuellStart !== null) {
+          const laenge = i - aktuellStart;
+          if (!beste || laenge > beste.laenge) beste = { start: aktuellStart, ende: i - 1, laenge };
+          aktuellStart = null;
+        }
+      }
+    }
+    if (aktuellStart !== null) {
+      const laenge = bewertet.length - aktuellStart;
+      if (!beste || laenge > beste.laenge) beste = { start: aktuellStart, ende: bewertet.length - 1, laenge };
+    }
+    return beste;
+  }
+
+  const fensterEl = document.getElementById('fenster-text');
+  const gruenesFenster = laengstesFenster('gruen');
+
+  if (gruenesFenster) {
+    const von = bewertet[gruenesFenster.start].zeit.slice(11, 16);
+    const bis = bewertet[gruenesFenster.ende].zeit.slice(11, 16);
+    const maxDiff = Math.max(...bewertet.slice(gruenesFenster.start, gruenesFenster.ende + 1).map(h => h.diff));
+    fensterEl.innerHTML = `Beste Lüftungszeit: <strong>${von}&ndash;${bis} Uhr</strong> `
+      + `(Taupunktdifferenz bis zu +${maxDiff.toFixed(1)} &deg;C)`;
+  } else {
+    fensterEl.innerHTML = `In den nächsten 24h wird die Schwelle von ${schwelle} &deg;C nicht erreicht &mdash; `
+      + `kein klar günstiges Zeitfenster. Kurz stoßlüften bringt nur begrenzten Effekt.`;
+  }
 }
 
 async function ladeUndBerechne() {
   const el = document.getElementById('aussen-content');
   el.innerHTML = '<p class="status">Lade Wetterdaten&hellip;</p>';
   try {
-    aussenData = await holeAussenwerte();
+    const daten = await holeAussenwerte();
+    aussenData = daten.current;
+    stundenData = daten.stunden;
     renderAussen();
     berechne();
   } catch (e) {
